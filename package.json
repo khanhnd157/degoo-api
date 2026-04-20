@@ -1,0 +1,43 @@
+{
+  "name": "degoo-sdk",
+  "version": "1.0.0",
+  "description": "TypeScript SDK for Degoo cloud storage API",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "example": "tsx examples/basic.ts",
+    "prepublishOnly": "npm run typecheck && npm run build"
+  },
+  "keywords": ["degoo", "cloud-storage", "sdk"],
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "form-data": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.3.0"
+  },
+  "files": ["dist"],
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

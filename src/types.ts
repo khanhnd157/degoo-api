@@ -1,0 +1,293 @@
+// ---------------------------------------------------------------------------
+// Session
+// ---------------------------------------------------------------------------
+
+/**
+ * Pluggable interface for persisting session tokens across process restarts.
+ *
+ * Implement this to store tokens in Redis, a database, encrypted storage, etc.
+ * The SDK ships two implementations: `FileSessionStore` and `MemorySessionStore`.
+ */
+export interface SessionStore {
+  /** Load the stored session string, or `null` if no session exists. */
+  load(): Promise<string | null>;
+  /** Persist the session string. */
+  save(data: string): Promise<void>;
+  /** Remove the stored session. */
+  clear(): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+/**
+ * Options accepted by the `DegooClient` constructor and `DegooClient.connect`.
+ * All fields are optional — omit any to use the built-in default.
+ */
+export interface DegooConfig {
+  /** Override the AppSync GraphQL endpoint. */
+  apiUrl?: string;
+  /** Override the REST login endpoint. */
+  loginUrl?: string;
+  /** Override the access-token exchange endpoint. */
+  accessTokenUrl?: string;
+  /** Override the AppSync API key (`x-api-key` header). */
+  apiToken?: string;
+  /** Override the `User-Agent` header sent on every request. */
+  userAgent?: string;
+  /**
+   * Extra headers merged into login requests.
+   * Use to override individual Degoo-specific auth headers if they change.
+   */
+  loginHeaders?: Record<string, string>;
+  /**
+   * Strategy for persisting session tokens between process restarts.
+   * Defaults to `FileSessionStore` (writes to `.degoo-session` in the CWD).
+   * Pass `new MemorySessionStore()` for ephemeral sessions.
+   */
+  sessionStore?: SessionStore;
+  /** Block size (bytes) used when streaming files for checksum computation. Default: 65536. */
+  blockSize?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+
+/** Returned by `login()` and `connect()` after a successful authentication. */
+export interface AuthResult {
+  /** Short-lived access token used to authorize all API requests. */
+  token: string;
+  /** The ID of the user's root storage folder (`"0"` for most accounts). */
+  rootPathId: string;
+}
+
+// ---------------------------------------------------------------------------
+// Profile
+// ---------------------------------------------------------------------------
+
+/** Degoo user profile and storage quota information. */
+export interface UserProfile {
+  ID: string;
+  FirstName: string;
+  LastName: string;
+  Email: string;
+  AvatarURL: string | null;
+  CountryCode: string;
+  LanguageCode: string;
+  Phone: string | null;
+  /** Account tier: 1 = Free, 2 = Pro, etc. */
+  AccountType: number;
+  /** Bytes used. */
+  UsedQuota: number;
+  /** Total storage capacity in bytes. */
+  TotalQuota: number;
+  OAuth2Provider: string | null;
+  GPMigrationStatus: number | null;
+}
+
+// ---------------------------------------------------------------------------
+// Files
+// ---------------------------------------------------------------------------
+
+/**
+ * Degoo file content categories.
+ *
+ * Returned as an integer in the `Category` field of file objects.
+ * Use `FileCategory.Photo`, `FileCategory.Video`, etc. to filter content
+ * when calling `listByCategory()`.
+ */
+export enum FileCategory {
+  Folder   = 2,
+  Photo    = 3,
+  Video    = 4,
+  Music    = 5,
+  Document = 6,
+  Archive  = 7,
+  Other    = 10,
+}
+
+/** Share status for a file or folder. */
+export interface ShareInfo {
+  Status: string;
+  ShareTime: string | null;
+}
+
+/** A file or folder entry returned by the Degoo API. */
+export interface DegooFile {
+  /** Unique identifier for this file or folder. */
+  ID: string;
+  Name: string;
+  /** Full path within the user's storage tree. */
+  FilePath: string;
+  /**
+   * File size in bytes.
+   * The Degoo API returns this as a numeric string (e.g. `"102400"`).
+   * Use `Number(file.Size)` when arithmetic is needed.
+   */
+  Size: string;
+  /**
+   * Presigned download URL.
+   * Only populated by `getFileChildren5`, `getFile()`, `getShared()`, and
+   * `getSharedWithMe()`. Empty string when listing via `listFiles()`.
+   */
+  URL: string;
+  ThumbnailURL: string | null;
+  MetadataID?: string;
+  MetadataKey?: string;
+  LastModificationTime?: string;
+  ParentID?: string;
+  IsShared?: boolean;
+}
+
+/**
+ * Full file or folder detail returned by `getFile()`.
+ *
+ * Extends `DegooFile` with metadata available only via `GetOverlay4` or
+ * `getFileChildren5`.
+ */
+export interface DegooFileDetail extends DegooFile {
+  /** Content type. See `FileCategory` enum. */
+  Category: number;
+  /** Whether the file is hidden from the main view. */
+  IsHidden: boolean;
+  /** Whether the file is in the recycle bin. */
+  IsInRecycleBin: boolean;
+  /** Share status, or `null` if the file has never been shared. */
+  Shareinfo: ShareInfo | null;
+  /** Unix timestamp (ms) of last upload. */
+  LastUploadTime?: string;
+  /** Internal user ID of the file owner. */
+  UserID?: number;
+  /** Device ID where the file was originally uploaded from. */
+  DeviceID?: number;
+}
+
+/** Paginated file listing returned by `listFiles()`. */
+export interface FileListResult {
+  files: DegooFile[];
+  /**
+   * Opaque cursor for the next page.
+   * Pass as `options.nextToken` to retrieve the following page.
+   * `null` means this is the last page.
+   */
+  nextToken: string | null;
+}
+
+/** Options for `listFiles()`. */
+export interface ListFilesOptions {
+  /** Maximum items per page. Default: 100. */
+  limit?: number;
+  /** Pagination cursor returned by a previous `listFiles()` call. */
+  nextToken?: string;
+  /**
+   * Sort order. 1 = ascending (default), 2 = descending.
+   */
+  order?: number;
+}
+
+/** Options for `listByCategory()`. */
+export interface CategoryListOptions {
+  /** Maximum items per page. Default: 100. */
+  limit?: number;
+  /** Pagination cursor from a previous `listByCategory()` call. */
+  nextToken?: string;
+  /** Filter: only return items created after this Unix timestamp (ms as string). */
+  minCreationTime?: string;
+  /** Filter: only return items created before this Unix timestamp (ms as string). */
+  maxCreationTime?: string;
+}
+
+/** Options for `listTrash()`. */
+export interface TrashListOptions {
+  /** Maximum items per page. Default: 100. */
+  limit?: number;
+  /** Pagination cursor from a previous `listTrash()` call. */
+  nextToken?: string;
+  /** Sort order. Default: 1 (ascending). */
+  order?: number;
+}
+
+/** Options for `getShared()`. */
+export interface SharedListOptions {
+  /** Include files the authenticated user uploaded and shared. Default: true. */
+  includeSelfContent?: boolean;
+  /** Return newest first. Default: true. */
+  orderDescending?: boolean;
+  /** Maximum items per page. Default: 100. */
+  limit?: number;
+  /** Pagination cursor. */
+  nextToken?: string;
+}
+
+/** Input for a single rename operation. */
+export interface FileRename {
+  /** ID of the file or folder to rename. */
+  fileId: string;
+  /** New display name. */
+  newName: string;
+}
+
+// ---------------------------------------------------------------------------
+// Upload
+// ---------------------------------------------------------------------------
+
+/** S3 presigned upload credentials returned by `getBucketWriteAuth4`. */
+export interface UploadAuthData {
+  PolicyBase64: string;
+  Signature: string;
+  /** S3 bucket endpoint to POST the file to. */
+  BaseURL: string;
+  /** Path prefix prepended to the S3 object key. */
+  KeyPrefix: string;
+  AccessKey: { Key: string; Value: string };
+  ACL: string;
+  AdditionalBody: Array<{ Key: string; Value: string }>;
+}
+
+/** Result returned after a successful `upload()` call. */
+export interface UploadResult {
+  /** Name the file was stored under. */
+  name: string;
+  /** ID of the folder the file was uploaded into. */
+  pathId: string;
+  /**
+   * `true` when the file's content was already present in Degoo's storage.
+   * Degoo deduplicates by checksum — the S3 upload is skipped but the
+   * metadata entry is still created.
+   */
+  alreadyExists: boolean;
+  /**
+   * The file's metadata after upload.
+   * May be `undefined` if Degoo's search index hasn't caught up yet.
+   */
+  file?: DegooFile;
+}
+
+// ---------------------------------------------------------------------------
+// Download
+// ---------------------------------------------------------------------------
+
+/** Options for `download()`. */
+export interface DownloadOptions {
+  /**
+   * Override the local filename.
+   * Defaults to the file's `Name` as returned by Degoo.
+   */
+  filename?: string;
+  /**
+   * Callback invoked periodically with download progress.
+   * `received` is bytes downloaded so far; `total` is the `Content-Length`
+   * (may be `undefined` if the server omits the header).
+   */
+  onProgress?: (received: number, total: number | undefined) => void;
+}
+
+/** Result returned after a successful `download()` call. */
+export interface DownloadResult {
+  /** Local filesystem path where the file was saved. */
+  path: string;
+  /** Total bytes written. */
+  size: number;
+}
