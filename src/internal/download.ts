@@ -1,6 +1,7 @@
 import fs from 'fs';
 import http from 'http';
 import https from 'https';
+import net from 'net';
 import path from 'path';
 import { Transform } from 'stream';
 import { pipeline } from 'stream/promises';
@@ -73,6 +74,55 @@ function assertNonEmptyString(value: unknown, name: string): asserts value is st
     throw new DegooError(`${name} must be a non-empty string`, undefined, DegooErrorCode.InvalidArgument);
   }
 }
+
+/**
+ * Whether the given IPv4 address falls inside a non-routable private range.
+ * Covers RFC 1918, loopback (127/8), link-local (169.254/16), and 0.0.0.0/8.
+ */
+const isPrivateIPv4 = (ip: string): boolean => {
+  if (!net.isIPv4(ip)) return false;
+  const [a, b] = ip.split('.').map(Number);
+  return (
+    a === 0 ||                                    // "this network"
+    a === 10 ||                                   // RFC 1918
+    a === 127 ||                                  // loopback
+    (a === 169 && b === 254) ||                   // link-local (incl. AWS metadata)
+    (a === 172 && b >= 16 && b <= 31) ||          // RFC 1918
+    (a === 192 && b === 168)                      // RFC 1918
+  );
+};
+
+/** Whether the given IPv6 address is loopback, link-local, or unique-local (`fc00::/7`). */
+const isPrivateIPv6 = (ip: string): boolean => {
+  if (!net.isIPv6(ip)) return false;
+  const lower = ip.toLowerCase();
+  return (
+    lower === '::1' ||
+    lower === '::' ||
+    lower.startsWith('fe80:') ||                  // link-local
+    /^f[cd][0-9a-f]{2}:/.test(lower)              // unique-local fc00::/7
+  );
+};
+
+/**
+ * Coarse "do not redirect here" check: returns `true` for `localhost`,
+ * IPv4 / IPv6 literals in private ranges, and other obviously-internal
+ * targets. DNS rebinding is **not** caught by this check — it only blocks
+ * hosts that are syntactically a private address.
+ *
+ * Used to defend against redirect-driven SSRF: a compromised CDN / S3
+ * bucket that responds with `Location: http://169.254.169.254/...` would
+ * otherwise be followed by the SDK and exfiltrate cloud-metadata creds.
+ */
+const isPrivateRedirectTarget = (urlStr: string): boolean => {
+  let parsed: URL;
+  try { parsed = new URL(urlStr); } catch { return false; }
+  const host = parsed.hostname.toLowerCase();
+  if (host === 'localhost' || host === 'ip6-localhost' || host === 'ip6-loopback') return true;
+  if (net.isIPv4(host)) return isPrivateIPv4(host);
+  if (net.isIPv6(host)) return isPrivateIPv6(host);
+  return false;
+};
 
 /**
  * Resolves a destination path and verifies it stays inside `destDir`.
@@ -411,6 +461,16 @@ export class DownloadService implements IDownloadService {
           if (url.startsWith('https://') && nextUrl.startsWith('http://')) {
             return reject(new DegooError(
               'Refusing to follow redirect from HTTPS to HTTP',
+              status,
+              DegooErrorCode.HttpStatus,
+            ));
+          }
+          // Defence-in-depth against redirect-driven SSRF: refuse to follow
+          // redirects that target localhost, RFC1918, link-local (169.254/16,
+          // including AWS metadata), or IPv6 loopback / unique-local.
+          if (isPrivateRedirectTarget(nextUrl)) {
+            return reject(new DegooError(
+              `Refusing to follow redirect to private host: ${new URL(nextUrl).hostname}`,
               status,
               DegooErrorCode.HttpStatus,
             ));
