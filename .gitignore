@@ -7,6 +7,7 @@ dist/
 # Session / credentials
 .degoo-session
 *.session
+.npmrc
 
 # Environment variables
 .env

@@ -116,16 +116,21 @@ export class UploadService implements IUploadService {
 
     for (const entry of entries) {
       const fullPath = path.join(dirPath, entry);
-      const isFile = (() => {
-        try { return fs.statSync(fullPath).isFile(); } catch { return false; }
-      })();
+      // Use lstat (not stat) so symlinks are NOT followed: a symlink inside
+      // dirPath could point outside it (e.g. to ~/.ssh/id_rsa) and silently
+      // exfiltrate data. Symlinks are skipped by design — pass linked targets
+      // explicitly via upload(path) if you really want them uploaded.
+      let stat: fs.Stats | null;
+      try { stat = fs.lstatSync(fullPath); } catch { stat = null; }
+      if (!stat || stat.isSymbolicLink()) continue;
 
-      if (isFile) {
+      if (stat.isFile()) {
         await this.uploadFile(fullPath, pid);
-      } else {
+      } else if (stat.isDirectory()) {
         const dir = await this.files.createDirectory(entry, pid);
         if (dir) await this.uploadDirectory(fullPath, dir.ID);
       }
+      // Other entry types (block device, FIFO, socket) are skipped silently.
     }
   }
 
