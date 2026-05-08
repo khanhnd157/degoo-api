@@ -291,3 +291,59 @@ export interface DownloadResult {
   /** Total bytes written. */
   size: number;
 }
+
+/**
+ * Options for `downloadFileStream()`.
+ *
+ * All fields are tuned for large-file scenarios where the default Axios/Node
+ * defaults are not safe (e.g. infinite hangs on stalled sockets, no resume).
+ */
+export interface DownloadStreamOptions {
+  /**
+   * Byte range to request (inclusive). Translated to an HTTP `Range` header.
+   * Use this to resume an interrupted download by passing
+   * `{ start: bytesAlreadyReceived }`.
+   */
+  range?: { start: number; end?: number };
+  /**
+   * Abort signal to cancel an in-flight download.
+   * Aborting after the stream is returned destroys the underlying socket.
+   */
+  signal?: AbortSignal;
+  /**
+   * Socket inactivity timeout in milliseconds. The connection is destroyed
+   * if no bytes flow for this duration. Default: 60_000 (60s).
+   */
+  timeoutMs?: number;
+  /**
+   * Number of additional attempts on transient connect/redirect errors before
+   * the response stream begins. Mid-stream errors are surfaced to the caller
+   * (resume by re-calling with `range.start`). Default: 3.
+   */
+  retries?: number;
+}
+
+/** Result returned by `downloadFileStream()`. */
+export interface DownloadStreamResult {
+  /**
+   * Node.js readable stream of the response body.
+   * Pipe to a writable, an HTTP response, or any consumer that accepts a stream.
+   * Listen to `'error'` on this stream to handle mid-stream network failures.
+   */
+  stream: NodeJS.ReadableStream;
+  /**
+   * Total bytes the stream will deliver, taken from the `Content-Length`
+   * header. `undefined` when the server omits the header (chunked encoding).
+   * For ranged requests this reflects the **range length**, not the full file.
+   */
+  size?: number;
+  /**
+   * Raw `Content-Range` header (e.g. `"bytes 0-1023/2048576"`) when the
+   * response is a 206 Partial Content. `undefined` for 200 OK responses.
+   */
+  contentRange?: string;
+  /** HTTP status of the final response after redirect resolution (200 or 206). */
+  statusCode: number;
+  /** Final URL that served the body (post-redirect). Useful for diagnostics. */
+  url: string;
+}

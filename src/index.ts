@@ -20,4 +20,6 @@ export type {
   UploadResult,
   DownloadOptions,
   DownloadResult,
+  DownloadStreamOptions,
+  DownloadStreamResult,
 } from './types';
