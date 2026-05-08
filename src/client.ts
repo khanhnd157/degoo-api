@@ -13,6 +13,8 @@ import {
   UploadResult,
   DownloadOptions,
   DownloadResult,
+  DownloadStreamOptions,
+  DownloadStreamResult,
 } from './types';
 import { FileSessionStore } from './session';
 import { DEFAULTS } from './internal/constants';
@@ -462,6 +464,91 @@ export class DegooClient {
    */
   download(fileId: string, destDir: string, options?: DownloadOptions): Promise<DownloadResult> {
     return this.downloadSvc.download(fileId, destDir, options);
+  }
+
+  /**
+   * Returns full file metadata, including a presigned download URL.
+   *
+   * Equivalent to `getFile()` — exposed alongside the other download helpers
+   * so download workflows can stay on a single `client.*` method namespace.
+   *
+   * @param fileId  ID of the file.
+   */
+  getFileInfo(fileId: string): Promise<DegooFileDetail> {
+    return this.downloadSvc.getFileInfo(fileId);
+  }
+
+  /**
+   * Returns the presigned download URL for a file. Throws when the file has
+   * no URL (folder, expired session, server error).
+   *
+   * Stricter sibling of `getFileUrl()` — prefer this when the caller cannot
+   * meaningfully proceed without a URL.
+   *
+   * @param fileId  ID of the file.
+   * @throws        `DegooError` if no URL is available.
+   */
+  getFileDownloadUrl(fileId: string): Promise<string> {
+    return this.downloadSvc.getFileDownloadUrl(fileId);
+  }
+
+  /**
+   * Opens a streaming download and returns a Node.js `Readable`.
+   *
+   * Built for large files: supports HTTP `Range` requests (resume after a
+   * network drop), socket idle timeouts, `AbortSignal` cancellation, and
+   * exponential-backoff retry on the initial connect. The returned stream
+   * gives the caller full control over where the bytes go — disk, HTTP
+   * response, S3 multipart upload, ffmpeg, etc. — without buffering the
+   * file in memory.
+   *
+   * @example Pipe to disk with progress and cancellation
+   * ```ts
+   * import fs from 'fs';
+   *
+   * const ctrl = new AbortController();
+   * const { stream, size } = await client.downloadFileStream(fileId, {
+   *   signal: ctrl.signal,
+   *   timeoutMs: 30_000,
+   * });
+   *
+   * let received = 0;
+   * stream.on('data', (chunk: Buffer) => {
+   *   received += chunk.length;
+   *   process.stdout.write(`\r${received}/${size ?? '?'}`);
+   * });
+   * stream.pipe(fs.createWriteStream('./big.zip'));
+   * // Cancel any time: ctrl.abort();
+   * ```
+   *
+   * @example Resume after a network drop
+   * ```ts
+   * const stat = fs.existsSync(dest) ? fs.statSync(dest) : { size: 0 };
+   * const { stream } = await client.downloadFileStream(fileId, {
+   *   range: { start: stat.size },
+   * });
+   * stream.pipe(fs.createWriteStream(dest, { flags: 'a' }));
+   * ```
+   *
+   * @example Stream straight to an Express response
+   * ```ts
+   * app.get('/file/:id', async (req, res) => {
+   *   const info = await client.getFileInfo(req.params.id);
+   *   res.setHeader('Content-Length', info.Size);
+   *   res.setHeader('Content-Disposition', `attachment; filename="${info.Name}"`);
+   *   const { stream } = await client.downloadFileStream(req.params.id);
+   *   stream.pipe(res);
+   * });
+   * ```
+   *
+   * @param fileId   ID of the file.
+   * @param options  Range, signal, timeout, and retry knobs.
+   */
+  downloadFileStream(
+    fileId: string,
+    options?: DownloadStreamOptions,
+  ): Promise<DownloadStreamResult> {
+    return this.downloadSvc.downloadFileStream(fileId, options);
   }
 
   // ---------------------------------------------------------------------------

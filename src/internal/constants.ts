@@ -44,3 +44,20 @@ export const DEFAULTS = {
   /** Default read-buffer size (bytes) for checksum streaming. */
   blockSize: 65536,
 } as const;
+
+/**
+ * Tunable defaults for the download streaming layer.
+ *
+ * Centralised here so the streaming layer stays free of magic numbers and
+ * tests / forks can adjust behaviour without editing implementation.
+ */
+export const DOWNLOAD_DEFAULTS = {
+  /** Socket-inactivity timeout (ms). Connection is destroyed if no bytes flow. */
+  timeoutMs: 60_000,
+  /** Retries on transient connect/redirect errors before the body starts. */
+  retries: 3,
+  /** Maximum redirect depth followed before giving up. */
+  maxRedirects: 10,
+  /** Initial backoff between retries (ms). Doubled on each subsequent attempt. */
+  initialBackoffMs: 500,
+} as const;
