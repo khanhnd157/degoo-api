@@ -18,6 +18,7 @@ export type {
   FileRename,
   ShareInfo,
   UploadAuthData,
+  UploadOptions,
   UploadResult,
   DownloadOptions,
   DownloadResult,

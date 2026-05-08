@@ -10,6 +10,7 @@ import {
   TrashListOptions,
   SharedListOptions,
   FileRename,
+  UploadOptions,
   UploadResult,
   DownloadOptions,
   DownloadResult,
@@ -412,12 +413,32 @@ export class DegooClient {
    * Degoo deduplicates by content checksum. When a duplicate is detected,
    * the S3 upload is skipped and `alreadyExists` is `true` in the result.
    *
+   * Pass an `UploadOptions` object for progress reporting, cancellation, and
+   * total-runtime caps. A bare string is still accepted for backwards
+   * compatibility and is treated as `{ filename }`.
+   *
    * @param filePath  Local path to the file or directory.
    * @param pathId    Destination folder. Defaults to root.
-   * @param filename  Override the stored filename (file uploads only).
+   * @param options   Upload options (filename, onProgress, signal, timeoutMs)
+   *                  or a string filename override.
+   *
+   * @example Track progress of a multi-GB upload
+   * ```ts
+   * const ctrl = new AbortController();
+   * const result = await client.upload('./big.iso', folderId, {
+   *   signal: ctrl.signal,
+   *   timeoutMs: 30 * 60_000,
+   *   onProgress: (sent, total) =>
+   *     process.stdout.write(`\r${sent}/${total}`),
+   * });
+   * ```
    */
-  upload(filePath: string, pathId?: string | number, filename?: string): Promise<UploadResult> {
-    return this.uploadSvc.upload(filePath, pathId, filename);
+  upload(
+    filePath: string,
+    pathId?: string | number,
+    options?: UploadOptions | string,
+  ): Promise<UploadResult> {
+    return this.uploadSvc.upload(filePath, pathId, options);
   }
 
   /**

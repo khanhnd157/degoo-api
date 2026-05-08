@@ -265,6 +265,42 @@ export interface UploadResult {
   file?: DegooFile;
 }
 
+/**
+ * Options for `upload()`.
+ *
+ * Built for large-file scenarios where the caller needs progress reporting,
+ * cancellation, and bounded total runtime. Passing none of these reproduces
+ * the previous fire-and-forget behaviour.
+ */
+export interface UploadOptions {
+  /**
+   * Override the stored filename. When omitted, the basename of the local
+   * path is used.
+   */
+  filename?: string;
+  /**
+   * Aborts the upload at the next observable boundary (checksum, S3 transfer,
+   * or metadata registration). Aborting after the S3 transfer has begun
+   * destroys the underlying socket; the promise rejects with an `Aborted` error.
+   */
+  signal?: AbortSignal;
+  /**
+   * Hard upper bound on the S3 transfer (milliseconds). The connection is
+   * destroyed if no bytes flow for this duration. Default: 0 (no timeout) —
+   * S3 uploads of multi-GB files should set this to several minutes.
+   */
+  timeoutMs?: number;
+  /**
+   * Callback invoked with cumulative byte counts as the file streams to S3.
+   * Fires roughly per network chunk; do not assume any specific cadence.
+   * `total` is the file size in bytes.
+   *
+   * Not called when `alreadyExists` is true — Degoo deduped by checksum and
+   * no bytes were transferred.
+   */
+  onProgress?: (uploaded: number, total: number) => void;
+}
+
 // ---------------------------------------------------------------------------
 // Download
 // ---------------------------------------------------------------------------

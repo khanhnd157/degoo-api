@@ -588,7 +588,10 @@ export class FileService implements IFileService {
         FileInfos: [{
           Checksum: checksum,
           Name: name,
-          CreationTime: Date.now(),
+          // Schema requires String! — Date.now() returns a Number which the
+          // server rejects as "Invalid input!" or silently coerces. Stringify
+          // explicitly to match the contract.
+          CreationTime: String(Date.now()),
           ParentID: pathId,
           Size: size,
         }],
