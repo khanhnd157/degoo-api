@@ -269,8 +269,61 @@ export interface UploadResult {
 // Download
 // ---------------------------------------------------------------------------
 
-/** Options for `download()`. */
-export interface DownloadOptions {
+/**
+ * Inclusive byte range for HTTP `Range` requests.
+ * Both bounds are 0-indexed; `end` is inclusive (matches RFC 7233).
+ */
+export interface ByteRange {
+  /** First byte offset, inclusive. Must be a non-negative integer. */
+  start: number;
+  /** Last byte offset, inclusive. Omit to request through end-of-file. */
+  end?: number;
+}
+
+/**
+ * Options for `downloadFileStream()`.
+ *
+ * Tuned for large-file scenarios where Node's defaults (no socket idle
+ * timeout, no abort, no resume) are unsafe.
+ */
+export interface DownloadStreamOptions {
+  /**
+   * Byte range to request (HTTP `Range`). Resume an interrupted download by
+   * passing `{ start: bytesAlreadyReceived }`. The server responds 206 with
+   * a `Content-Range` header when honoured.
+   */
+  range?: ByteRange;
+  /**
+   * Abort signal that cancels an in-flight download.
+   * Aborting after the stream is returned destroys the underlying socket;
+   * the stream emits an `'error'` event with code `Aborted`.
+   */
+  signal?: AbortSignal;
+  /**
+   * Socket inactivity timeout in milliseconds. The connection is destroyed
+   * if no bytes flow for this duration. Default: 60_000.
+   */
+  timeoutMs?: number;
+  /**
+   * Number of additional attempts on transient connect/redirect errors
+   * **before** the response body begins. Mid-stream errors are surfaced to
+   * the caller — resume by re-calling with `range.start`. Default: 3.
+   *
+   * Only network errors and HTTP 408/429/5xx are retried; 4xx errors fail
+   * fast.
+   */
+  retries?: number;
+}
+
+/**
+ * Options for `download()`.
+ *
+ * Inherits all streaming-layer knobs from `DownloadStreamOptions` (signal,
+ * timeoutMs, retries) so the simple file API gets the same large-file
+ * safety as the stream API. `range` is intentionally excluded — `download()`
+ * always writes the full file from offset 0.
+ */
+export interface DownloadOptions extends Omit<DownloadStreamOptions, 'range'> {
   /**
    * Override the local filename.
    * Defaults to the file's `Name` as returned by Degoo.
@@ -290,37 +343,6 @@ export interface DownloadResult {
   path: string;
   /** Total bytes written. */
   size: number;
-}
-
-/**
- * Options for `downloadFileStream()`.
- *
- * All fields are tuned for large-file scenarios where the default Axios/Node
- * defaults are not safe (e.g. infinite hangs on stalled sockets, no resume).
- */
-export interface DownloadStreamOptions {
-  /**
-   * Byte range to request (inclusive). Translated to an HTTP `Range` header.
-   * Use this to resume an interrupted download by passing
-   * `{ start: bytesAlreadyReceived }`.
-   */
-  range?: { start: number; end?: number };
-  /**
-   * Abort signal to cancel an in-flight download.
-   * Aborting after the stream is returned destroys the underlying socket.
-   */
-  signal?: AbortSignal;
-  /**
-   * Socket inactivity timeout in milliseconds. The connection is destroyed
-   * if no bytes flow for this duration. Default: 60_000 (60s).
-   */
-  timeoutMs?: number;
-  /**
-   * Number of additional attempts on transient connect/redirect errors before
-   * the response stream begins. Mid-stream errors are surfaced to the caller
-   * (resume by re-calling with `range.start`). Default: 3.
-   */
-  retries?: number;
 }
 
 /** Result returned by `downloadFileStream()`. */
