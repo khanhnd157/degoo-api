@@ -10,6 +10,7 @@ import {
   TrashListOptions,
   SharedListOptions,
   FileRename,
+  UploadOptions,
   UploadResult,
   DownloadOptions,
   DownloadResult,
@@ -20,6 +21,7 @@ import { FileSessionStore } from './session';
 import { DEFAULTS } from './internal/constants';
 import { createApiClient, createLoginClient } from './internal/http';
 import { AuthService, IAuthService } from './internal/auth';
+import { ProfileService, IProfileService } from './internal/profile';
 import { FileService, IFileService } from './internal/files';
 import { UploadService, IUploadService } from './internal/upload';
 import { DownloadService, IDownloadService } from './internal/download';
@@ -27,12 +29,13 @@ import { DownloadService, IDownloadService } from './internal/download';
 /**
  * The main entry point for the Degoo SDK.
  *
- * `DegooClient` is a **facade** (GoF Facade pattern) composing four
+ * `DegooClient` is a **facade** (GoF Facade pattern) composing five
  * focused services behind a single ergonomic API:
  *
  * | Service           | Responsibility                                        |
  * |-------------------|-------------------------------------------------------|
  * | `AuthService`     | Login, logout, session restore, token refresh.        |
+ * | `ProfileService`  | User-profile read and update.                         |
  * | `FileService`     | Listing, search, metadata, rename, move, delete, share.|
  * | `UploadService`   | Single-file and recursive-directory uploads.          |
  * | `DownloadService` | Presigned URL resolution and file streaming.          |
@@ -67,12 +70,13 @@ import { DownloadService, IDownloadService } from './internal/download';
  */
 export class DegooClient {
   private readonly authSvc: IAuthService;
+  private readonly profileSvc: IProfileService;
   private readonly fileSvc: IFileService;
   private readonly uploadSvc: IUploadService;
   private readonly downloadSvc: IDownloadService;
 
   /**
-   * Constructs a `DegooClient` with all four internal services wired up.
+   * Constructs a `DegooClient` with all five internal services wired up.
    *
    * Prefer the static `DegooClient.connect()` factory — it handles login in
    * a single `await`.
@@ -93,6 +97,7 @@ export class DegooClient {
     const loginHttp = createLoginClient(userAgent, apiToken, config.loginHeaders);
 
     this.authSvc     = new AuthService(loginHttp, apiHttp, sessionStore, loginUrl, accessTokenUrl, apiUrl);
+    this.profileSvc  = new ProfileService(apiHttp, apiUrl, this.authSvc);
     this.fileSvc     = new FileService(apiHttp, apiUrl, this.authSvc);
     this.uploadSvc   = new UploadService(apiHttp, apiUrl, this.authSvc, this.fileSvc, blockSize);
     this.downloadSvc = new DownloadService(this.fileSvc);
@@ -148,7 +153,19 @@ export class DegooClient {
    * @throws `DegooError('Unauthorized')` if the session has expired.
    */
   getProfile(): Promise<UserProfile> {
-    return this.fileSvc.getProfile();
+    return this.profileSvc.getProfile();
+  }
+
+  /**
+   * Updates editable profile fields. Pass only the fields to change.
+   *
+   * @example
+   * await client.updateProfile({ FirstName: 'Test', LastName: 'User' });
+   */
+  updateProfile(
+    updates: Partial<Pick<UserProfile, 'FirstName' | 'LastName' | 'CountryCode' | 'LanguageCode'>>,
+  ): Promise<void> {
+    return this.profileSvc.updateProfile(updates);
   }
 
   // ---------------------------------------------------------------------------
@@ -412,12 +429,32 @@ export class DegooClient {
    * Degoo deduplicates by content checksum. When a duplicate is detected,
    * the S3 upload is skipped and `alreadyExists` is `true` in the result.
    *
+   * Pass an `UploadOptions` object for progress reporting, cancellation, and
+   * total-runtime caps. A bare string is still accepted for backwards
+   * compatibility and is treated as `{ filename }`.
+   *
    * @param filePath  Local path to the file or directory.
    * @param pathId    Destination folder. Defaults to root.
-   * @param filename  Override the stored filename (file uploads only).
+   * @param options   Upload options (filename, onProgress, signal, timeoutMs)
+   *                  or a string filename override.
+   *
+   * @example Track progress of a multi-GB upload
+   * ```ts
+   * const ctrl = new AbortController();
+   * const result = await client.upload('./big.iso', folderId, {
+   *   signal: ctrl.signal,
+   *   timeoutMs: 30 * 60_000,
+   *   onProgress: (sent, total) =>
+   *     process.stdout.write(`\r${sent}/${total}`),
+   * });
+   * ```
    */
-  upload(filePath: string, pathId?: string | number, filename?: string): Promise<UploadResult> {
-    return this.uploadSvc.upload(filePath, pathId, filename);
+  upload(
+    filePath: string,
+    pathId?: string | number,
+    options?: UploadOptions | string,
+  ): Promise<UploadResult> {
+    return this.uploadSvc.upload(filePath, pathId, options);
   }
 
   /**

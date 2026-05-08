@@ -1,10 +1,10 @@
 import fs from 'fs';
 import path from 'path';
-import { AxiosInstance } from 'axios';
+import axios, { AxiosInstance } from 'axios';
 import FormData from 'form-data';
 
-import { DegooError } from '../errors';
-import { UploadAuthData, UploadResult } from '../types';
+import { DegooError, DegooErrorCode } from '../errors';
+import { UploadAuthData, UploadOptions, UploadResult } from '../types';
 import { IAuthService } from './auth';
 import { IFileService } from './files';
 import { checkGqlErrors, throwDegooError } from './http';
@@ -30,9 +30,15 @@ export interface IUploadService {
    *
    * @param filePath  Absolute or relative path to the file or directory.
    * @param pathId    Destination folder in Degoo. Defaults to the root folder.
-   * @param filename  Override the stored filename (file uploads only).
+   * @param options   Filename override, progress callback, abort signal,
+   *                  and timeout. Pass a string for backwards-compatible
+   *                  filename-only override.
    */
-  upload(filePath: string, pathId?: string | number, filename?: string): Promise<UploadResult>;
+  upload(
+    filePath: string,
+    pathId?: string | number,
+    options?: UploadOptions | string,
+  ): Promise<UploadResult>;
 
   /**
    * Recursively uploads all files in `dirPath` into the Degoo folder `pathId`.
@@ -60,7 +66,8 @@ export interface IUploadService {
  * 4. **S3 upload** — POST the file as `multipart/form-data` to the S3 bucket.
  * 5. **Register metadata** — call `SetUploadFile3` so the file appears in the
  *    user's folder tree.
- * 6. **Search** — query the search index to return the newly created file entry.
+ * 6. **Resolve** — query the search index by checksum/name to return the
+ *    newly created file entry.
  *
  * Depends on `IAuthService` for the access token and `IFileService` for
  * `createDirectory` / `search` / `registerItem` (DIP).
@@ -86,8 +93,15 @@ export class UploadService implements IUploadService {
   // Public API
   // ---------------------------------------------------------------------------
 
-  async upload(filePath: string, pathId?: string | number, filename?: string): Promise<UploadResult> {
-    const pid = this.pid(pathId);
+  async upload(
+    filePath: string,
+    pathId?: string | number,
+    options: UploadOptions | string = {},
+  ): Promise<UploadResult> {
+    // Backwards compatibility: callers used to pass a plain string filename.
+    const opts: UploadOptions = typeof options === 'string' ? { filename: options } : options;
+
+    const pid = await this.resolvePid(pathId);
 
     let stat: fs.Stats;
     try {
@@ -101,11 +115,11 @@ export class UploadService implements IUploadService {
       return { name: path.basename(filePath), pathId: pid, alreadyExists: false };
     }
 
-    return this.uploadFile(filePath, pid, filename);
+    return this.uploadFile(filePath, pid, stat.size, opts);
   }
 
   async uploadDirectory(dirPath: string, pathId?: string | number): Promise<void> {
-    const pid = this.pid(pathId);
+    const pid = await this.resolvePid(pathId);
 
     let entries: string[];
     try {
@@ -125,7 +139,7 @@ export class UploadService implements IUploadService {
       if (!stat || stat.isSymbolicLink()) continue;
 
       if (stat.isFile()) {
-        await this.uploadFile(fullPath, pid);
+        await this.uploadFile(fullPath, pid, stat.size, {});
       } else if (stat.isDirectory()) {
         const dir = await this.files.createDirectory(entry, pid);
         if (dir) await this.uploadDirectory(fullPath, dir.ID);
@@ -139,24 +153,45 @@ export class UploadService implements IUploadService {
   // ---------------------------------------------------------------------------
 
   /**
-   * Resolves a caller-supplied `pathId` to a string, falling back to the
-   * user's root folder when no `pathId` is provided.
+   * Resolves a caller-supplied `pathId`, delegating the lookup of the
+   * device-folder root to `IFileService.resolveDefaultParent`. See that
+   * method for why uploads cannot target the literal root `"0"`.
    */
-  private pid(pathId?: string | number): string {
-    return String(pathId ?? (this.auth.getRootPathId() || '0'));
+  private resolvePid(pathId?: string | number): Promise<string> {
+    return this.files.resolveDefaultParent(pathId);
+  }
+
+  private throwIfAborted(signal: AbortSignal | undefined, stage: string): void {
+    if (signal?.aborted) {
+      throw new DegooError(`Upload aborted: ${stage}`, undefined, DegooErrorCode.Aborted);
+    }
   }
 
   /**
    * Executes the full six-step upload flow for a single file.
    */
-  private async uploadFile(filePath: string, pathId: string, filename?: string): Promise<UploadResult> {
-    const name = filename ?? path.basename(filePath);
+  private async uploadFile(
+    filePath: string,
+    pathId: string,
+    size: number,
+    opts: UploadOptions,
+  ): Promise<UploadResult> {
+    const name = opts.filename ?? path.basename(filePath);
     const ext = path.extname(filePath).replace('.', '');
-    const size = fs.statSync(filePath).size;
-    const checksum = await computeChecksum(filePath, this.blockSize);
 
-    // Step 2: warm up upload pipeline (fire-and-forget; failure is non-fatal).
-    await this.pingOverlay().catch(() => undefined);
+    this.throwIfAborted(opts.signal, 'before checksum');
+    const checksum = await computeChecksum(filePath, this.blockSize);
+    this.throwIfAborted(opts.signal, 'before overlay');
+
+    // Step 2: warm up upload pipeline. Server commonly returns "Got empty
+    // result!" for accounts without overlay state — that's expected, not an
+    // error, so we swallow only that message and re-throw transport faults.
+    await this.pingOverlay().catch((err) => {
+      if (!(err instanceof DegooError) || err.message !== 'Got empty result!') {
+        throw err;
+      }
+    });
+    this.throwIfAborted(opts.signal, 'before S3 auth');
 
     // Step 3: obtain S3 presigned credentials.
     const authData = await this.getUploadAuth(pathId, checksum, name, size);
@@ -164,22 +199,34 @@ export class UploadService implements IUploadService {
 
     // Step 4: upload file bytes to S3 (skipped if content already exists).
     if (authData !== null) {
-      await this.pushToStorage(authData, checksum, name, ext, filePath);
+      this.throwIfAborted(opts.signal, 'before S3 upload');
+      await this.pushToStorage(authData, checksum, name, ext, filePath, size, opts);
     }
 
-    // Steps 5 & 6: register the metadata entry and resolve the created file.
+    this.throwIfAborted(opts.signal, 'before metadata register');
+    // Step 5: register the metadata entry.
     await this.files.registerItem(name, pathId, String(size), checksum);
-    const results = await this.files.search(name, 1);
 
-    return { name, pathId, alreadyExists, file: results[0] };
+    // Step 6: resolve the just-created file entry. Match strictly on the
+    // destination ParentID — the global search index can lag behind the
+    // mutation, in which case `file` will be `undefined` (already permitted
+    // by `UploadResult.file`). Returning a homonym from another folder
+    // would be worse than nothing: the caller would get an unrelated file's
+    // ID and presigned URL.
+    const candidates = await this.files.search(name, 20);
+    const file = candidates.find((c) => c.ParentID === pathId);
+
+    return { name, pathId, alreadyExists, file };
   }
 
   /**
    * Sends a `GetOverlay4` query to prime Degoo's upload pipeline.
    *
-   * This call is always made before requesting S3 credentials. Its exact
-   * server-side effect is undocumented, but omitting it increases the chance
-   * of receiving malformed or missing auth credentials.
+   * The query needs an `IDType.FileID` (`String!` per the AppSync schema).
+   * Use the user's actual root id when available — accounts whose login
+   * redirect resolved to a non-`"0"` folder will reject a hard-coded `"0"`
+   * with anything other than `Got empty result!`, and our caller only
+   * swallows that one specific message.
    */
   private async pingOverlay(): Promise<void> {
     const query = `
@@ -187,11 +234,22 @@ export class UploadService implements IUploadService {
         getOverlay4(Token: $Token, ID: $ID) { ID Name FilePath Size URL Category }
       }
     `;
-    await this.http.post(this.apiUrl, {
-      operationName: 'GetOverlay4',
-      variables: { Token: this.auth.getToken(), ID: { FileID: 0 } },
-      query,
-    });
+    try {
+      const { data } = await this.http.post<{
+        data: { getOverlay4: unknown };
+        errors?: Array<{ message: string }>;
+      }>(this.apiUrl, {
+        operationName: 'GetOverlay4',
+        variables: {
+          Token: this.auth.getToken(),
+          ID: { FileID: this.auth.getRootPathId() || '0' },
+        },
+        query,
+      });
+      checkGqlErrors(data);
+    } catch (err) {
+      throwDegooError(err);
+    }
   }
 
   /**
@@ -302,6 +360,10 @@ export class UploadService implements IUploadService {
    * The form fields are ordered exactly as Degoo's S3 policy requires.
    * `content-length` must be set explicitly because AWS S3 rejects chunked
    * transfer encoding on presigned POST requests.
+   *
+   * The file is streamed via `fs.createReadStream`; axios pipes the
+   * `form-data` stream straight into the socket. Memory stays bounded
+   * regardless of file size, modulo per-chunk progress accounting.
    */
   private async pushToStorage(
     auth: UploadAuthData,
@@ -309,8 +371,14 @@ export class UploadService implements IUploadService {
     name: string,
     ext: string,
     filePath: string,
+    fileSize: number,
+    opts: UploadOptions,
   ): Promise<void> {
     const mime = UploadService.getMimeType(ext);
+    // 64 KiB highWaterMark — explicit so disk reads cannot outrun network
+    // backpressure, even on fast SSDs.
+    const fileStream = fs.createReadStream(filePath, { highWaterMark: 64 * 1024 });
+
     const form = new FormData();
     form.append('key', `${auth.KeyPrefix}${ext}/${checksum}.${ext}`);
     form.append('acl', auth.ACL);
@@ -319,14 +387,17 @@ export class UploadService implements IUploadService {
     form.append(auth.AccessKey.Key, auth.AccessKey.Value);
     form.append('Cache-control', auth.AdditionalBody?.[0]?.Value ?? '');
     form.append('Content-Type', mime);
-    form.append('file', fs.createReadStream(filePath), {
-      filename: name,
-      contentType: mime,
-    });
+    form.append('file', fileStream, { filename: name, contentType: mime });
 
     const contentLength = await new Promise<number>((resolve, reject) => {
       form.getLength((err, len) => (err ? reject(err) : resolve(len)));
     });
+
+    // Axios reports progress relative to the total request body (form fields
+    // + boundaries + file). For UX, scale the file payload to [0, fileSize].
+    // The form overhead is small (~hundreds of bytes), but rounding via
+    // Math.min avoids ever exceeding fileSize.
+    const onProgress = opts.onProgress;
 
     try {
       await this.http.post(auth.BaseURL, form, {
@@ -335,9 +406,30 @@ export class UploadService implements IUploadService {
           'content-length': String(contentLength),
           'ngsw-bypass': '1',
         },
+        signal: opts.signal,
+        timeout: opts.timeoutMs && opts.timeoutMs > 0 ? opts.timeoutMs : 0,
+        // Axios v1.16+ supports onUploadProgress on the Node http adapter;
+        // it pipelines through an AxiosTransformStream that measures bytes
+        // at network consumption rate (not disk read rate), so the UI sees
+        // true upload speed.
+        onUploadProgress: onProgress
+          ? (e) => {
+              const sent = Math.min(e.loaded, fileSize);
+              onProgress(sent, fileSize);
+            }
+          : undefined,
       });
     } catch (err) {
+      // Preserve the abort contract: when the caller's AbortSignal fires
+      // mid-flight, axios rejects with a Cancel/Canceled — translate that
+      // back into our Aborted code so consumers can branch on it.
+      if (axios.isCancel(err) || opts.signal?.aborted) {
+        throw new DegooError('Upload aborted: S3 transfer', undefined, DegooErrorCode.Aborted);
+      }
       throwDegooError(err);
+    } finally {
+      // Make sure the file descriptor is released on cancel/timeout/throw.
+      if (!fileStream.destroyed) fileStream.destroy();
     }
   }
 }

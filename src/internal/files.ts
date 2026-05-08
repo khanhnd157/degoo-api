@@ -1,7 +1,6 @@
 import { AxiosInstance } from 'axios';
 import { DegooError } from '../errors';
 import {
-  UserProfile,
   DegooFile,
   DegooFileDetail,
   FileListResult,
@@ -17,15 +16,6 @@ import { checkGqlErrors, throwDegooError } from './http';
 // ---------------------------------------------------------------------------
 // GraphQL query / mutation strings
 // ---------------------------------------------------------------------------
-
-const Q_GET_PROFILE = `
-  query GetUserInfo3($Token: String!) {
-    getUserInfo3(Token: $Token) {
-      ID FirstName LastName Email AvatarURL CountryCode LanguageCode
-      Phone AccountType UsedQuota TotalQuota OAuth2Provider GPMigrationStatus
-    }
-  }
-`;
 
 const Q_LIST_FILES = `
   query GetFileChildren5(
@@ -226,9 +216,6 @@ const Q_SHARED_WITH_ME = `
  * the full `FileService` (DIP + ISP).
  */
 export interface IFileService {
-  // Profile
-  getProfile(): Promise<UserProfile>;
-
   // Listing
   listFiles(pathId?: string | number, options?: ListFilesOptions): Promise<FileListResult>;
   listAll(pathId?: string | number): Promise<DegooFile[]>;
@@ -268,6 +255,12 @@ export interface IFileService {
    * to the concrete `FileService` class.
    */
   registerItem(name: string, pathId: string, size?: string, checksum?: string): Promise<void>;
+
+  /**
+   * Returns the effective parent folder id for write operations.
+   * See `FileService.resolveDefaultParent` for full semantics.
+   */
+  resolveDefaultParent(pathId?: string | number): Promise<string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -316,18 +309,6 @@ export class FileService implements IFileService {
     } catch (err) {
       throwDegooError(err);
     }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Profile
-  // ---------------------------------------------------------------------------
-
-  async getProfile(): Promise<UserProfile> {
-    const r = await this.gql<{ getUserInfo3: UserProfile | null }>(
-      'GetUserInfo3', {}, Q_GET_PROFILE,
-    );
-    if (!r.getUserInfo3) throw new DegooError('Unauthorized');
-    return r.getUserInfo3;
   }
 
   // ---------------------------------------------------------------------------
@@ -451,12 +432,68 @@ export class FileService implements IFileService {
    *
    * Because Degoo's mutation does not return the new folder, the method
    * searches for it afterwards. Search-index latency may cause `null` to be
-   * returned on success — retry with a short delay if the result is needed.
+   * returned even on success — retry with a short delay if the caller needs
+   * the folder ID immediately.
+   *
+   * When `pathId` is omitted, the folder is created inside the user's
+   * device-folder root (resolved via `resolveDefaultParent`, typically `Web`
+   * or `My Drive`). Degoo rejects writes targeting the literal root `"0"`
+   * with `"Error creating entries!"`.
+   *
+   * Match is strict on `ParentID`: a homonym from a different folder would
+   * be worse than a `null` return, since the caller would silently take
+   * action on the wrong directory.
    */
   async createDirectory(name: string, pathId?: string | number): Promise<DegooFile | null> {
-    await this.registerItem(name, this.pid(pathId));
-    return (await this.search(name, 1))[0] ?? null;
+    const parent = await this.resolveDefaultParent(pathId);
+    await this.registerItem(name, parent);
+    const matches = await this.search(name, 20);
+    return matches.find((m) => m.ParentID === parent) ?? null;
   }
+
+  /**
+   * Returns the effective parent folder id for write operations.
+   *
+   * - If the caller supplied a non-empty `pathId`, returns it unchanged.
+   * - Otherwise resolves the *device-folder root* (a writable container
+   *   automatically created by Degoo when you log in via web/mobile).
+   *   The literal root `"0"` is not a valid upload destination — Degoo
+   *   returns `Invalid input!`.
+   *
+   * Selection heuristics, in order:
+   *   1. Folder named exactly `Web` or `My Drive` (Degoo's default web/desktop
+   *      device folders, with `My Drive` being the post-rebranding name).
+   *   2. The largest folder by `Size` (proxy for "most-used device folder" —
+   *      a freshly-onboarded mobile-only account will pick the phone folder).
+   *   3. The first folder returned, regardless.
+   *
+   * Memoised; subsequent calls are O(1).
+   */
+  async resolveDefaultParent(pathId?: string | number): Promise<string> {
+    if (pathId !== undefined && pathId !== null && pathId !== '') {
+      return String(pathId);
+    }
+    if (this.defaultParentId) return this.defaultParentId;
+
+    const rootId = this.auth.getRootPathId() || '0';
+    try {
+      const { files } = await this.listFiles(rootId, { limit: 50 });
+      const preferred = files.find((f) => f.Name === 'Web' || f.Name === 'My Drive');
+      const largest = [...files].sort((a, b) => Number(b.Size) - Number(a.Size))[0];
+      const chosen = preferred ?? largest ?? files[0];
+      if (chosen?.ID) {
+        this.defaultParentId = chosen.ID;
+        return chosen.ID;
+      }
+    } catch {
+      // Listing failed — fall through so the caller still gets a chance
+      // (e.g. they may have an explicitly-allowed parent id elsewhere).
+    }
+    return rootId;
+  }
+
+  /** Memoised device-folder root, resolved lazily on first write op. */
+  private defaultParentId: string | null = null;
 
   // ---------------------------------------------------------------------------
   // File mutations
@@ -481,8 +518,15 @@ export class FileService implements IFileService {
   /**
    * Moves files to the recycle bin.
    *
-   * Note: `setDeleteFile5` does not work for files uploaded via the API on some
-   * account types — callers should handle `DegooError('Got empty result!')`.
+   * `setDeleteFile5` is gated by Degoo for entries whose key path the caller
+   * doesn't know. The implementation transparently retries via `MetadataID`
+   * (resolved by `getOverlay4`) when the first attempt fails with
+   * `"Got empty result!"`, so most folder/file deletes succeed without the
+   * caller juggling identifier types.
+   *
+   * Some recently-created folders may still reject both attempts — Degoo's
+   * indexer can lag the mutation by several seconds. Retry the call after
+   * a short delay if it surfaces a `Got empty result!` `DegooError`.
    */
   async delete(fileIds: string[]): Promise<void> {
     await this.setDeleteFile(fileIds, true);
@@ -588,7 +632,10 @@ export class FileService implements IFileService {
         FileInfos: [{
           Checksum: checksum,
           Name: name,
-          CreationTime: Date.now(),
+          // Schema requires String! — Date.now() returns a Number which the
+          // server rejects as "Invalid input!" or silently coerces. Stringify
+          // explicitly to match the contract.
+          CreationTime: String(Date.now()),
           ParentID: pathId,
           Size: size,
         }],
@@ -618,11 +665,42 @@ export class FileService implements IFileService {
     );
   }
 
-  /** Calls `setDeleteFile5` to move files into or out of the recycle bin. */
+  /**
+   * Calls `setDeleteFile5` to move files into or out of the recycle bin.
+   *
+   * Degoo's `setDeleteFile5` returns `Got empty result!` for some entries
+   * (notably folders created by API uploads on certain account types) when
+   * referenced by `FileID`. On that specific failure we fetch each item's
+   * `MetadataID` via `getOverlay4` and retry — that key path is accepted
+   * in cases where `FileID` is silently dropped.
+   */
   private async setDeleteFile(fileIds: string[], isInRecycleBin: boolean): Promise<void> {
+    try {
+      await this.gql<{ setDeleteFile5: unknown }>(
+        'SetDeleteFile5',
+        { IsInRecycleBin: isInRecycleBin, IDs: fileIds.map(id => ({ FileID: id })) },
+        M_DELETE,
+      );
+      return;
+    } catch (err) {
+      if (!(err instanceof DegooError) || err.message !== 'Got empty result!') {
+        throw err;
+      }
+    }
+
+    const metadataIds = await Promise.all(
+      fileIds.map(async (id) => {
+        const detail = await this.getFile(id);
+        if (!detail.MetadataID) {
+          throw new DegooError(`No MetadataID for file ${id} — cannot delete`);
+        }
+        return detail.MetadataID;
+      }),
+    );
+
     await this.gql<{ setDeleteFile5: unknown }>(
       'SetDeleteFile5',
-      { IsInRecycleBin: isInRecycleBin, IDs: fileIds.map(id => ({ FileID: id })) },
+      { IsInRecycleBin: isInRecycleBin, IDs: metadataIds.map((mid) => ({ MetadataID: mid })) },
       M_DELETE,
     );
   }
