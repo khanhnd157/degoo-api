@@ -1,7 +1,6 @@
 import { AxiosInstance } from 'axios';
 import { DegooError } from '../errors';
 import {
-  UserProfile,
   DegooFile,
   DegooFileDetail,
   FileListResult,
@@ -17,15 +16,6 @@ import { checkGqlErrors, throwDegooError } from './http';
 // ---------------------------------------------------------------------------
 // GraphQL query / mutation strings
 // ---------------------------------------------------------------------------
-
-const Q_GET_PROFILE = `
-  query GetUserInfo3($Token: String!) {
-    getUserInfo3(Token: $Token) {
-      ID FirstName LastName Email AvatarURL CountryCode LanguageCode
-      Phone AccountType UsedQuota TotalQuota OAuth2Provider GPMigrationStatus
-    }
-  }
-`;
 
 const Q_LIST_FILES = `
   query GetFileChildren5(
@@ -226,9 +216,6 @@ const Q_SHARED_WITH_ME = `
  * the full `FileService` (DIP + ISP).
  */
 export interface IFileService {
-  // Profile
-  getProfile(): Promise<UserProfile>;
-
   // Listing
   listFiles(pathId?: string | number, options?: ListFilesOptions): Promise<FileListResult>;
   listAll(pathId?: string | number): Promise<DegooFile[]>;
@@ -268,6 +255,12 @@ export interface IFileService {
    * to the concrete `FileService` class.
    */
   registerItem(name: string, pathId: string, size?: string, checksum?: string): Promise<void>;
+
+  /**
+   * Returns the effective parent folder id for write operations.
+   * See `FileService.resolveDefaultParent` for full semantics.
+   */
+  resolveDefaultParent(pathId?: string | number): Promise<string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -316,18 +309,6 @@ export class FileService implements IFileService {
     } catch (err) {
       throwDegooError(err);
     }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Profile
-  // ---------------------------------------------------------------------------
-
-  async getProfile(): Promise<UserProfile> {
-    const r = await this.gql<{ getUserInfo3: UserProfile | null }>(
-      'GetUserInfo3', {}, Q_GET_PROFILE,
-    );
-    if (!r.getUserInfo3) throw new DegooError('Unauthorized');
-    return r.getUserInfo3;
   }
 
   // ---------------------------------------------------------------------------
@@ -452,11 +433,54 @@ export class FileService implements IFileService {
    * Because Degoo's mutation does not return the new folder, the method
    * searches for it afterwards. Search-index latency may cause `null` to be
    * returned on success — retry with a short delay if the result is needed.
+   *
+   * When `pathId` is omitted, the folder is created inside the user's
+   * device-folder root (e.g. `Web`) rather than the literal root `"0"` —
+   * Degoo rejects writes to `"0"` with `"Error creating entries!"`.
    */
   async createDirectory(name: string, pathId?: string | number): Promise<DegooFile | null> {
-    await this.registerItem(name, this.pid(pathId));
-    return (await this.search(name, 1))[0] ?? null;
+    const parent = await this.resolveDefaultParent(pathId);
+    await this.registerItem(name, parent);
+    const matches = await this.search(name, 20);
+    return matches.find((m) => m.ParentID === parent) ?? matches[0] ?? null;
   }
+
+  /**
+   * Returns the effective parent folder id for write operations.
+   *
+   * - If the caller supplied a non-empty `pathId`, returns it unchanged.
+   * - Otherwise resolves the *device-folder root* (a writable container
+   *   automatically created by Degoo when you log in via web/mobile, e.g.
+   *   `Web` or `Samsung SM-…`). Defaulting to the literal root `"0"` is
+   *   not a valid upload destination — Degoo returns `Invalid input!`.
+   *
+   * The resolution result is memoised; subsequent calls are O(1).
+   */
+  async resolveDefaultParent(pathId?: string | number): Promise<string> {
+    if (pathId !== undefined && pathId !== null && pathId !== '') {
+      return String(pathId);
+    }
+    if (this.defaultParentId) return this.defaultParentId;
+
+    const rootId = this.auth.getRootPathId() || '0';
+    try {
+      const { files } = await this.listFiles(rootId, { limit: 50 });
+      const web = files.find((f) => f.Name === 'Web');
+      const fallback = files[0];
+      const chosen = web ?? fallback;
+      if (chosen?.ID) {
+        this.defaultParentId = chosen.ID;
+        return chosen.ID;
+      }
+    } catch {
+      // Listing failed — fall through so the caller still gets a chance
+      // (e.g. they may have an explicitly-allowed parent id elsewhere).
+    }
+    return rootId;
+  }
+
+  /** Memoised device-folder root, resolved lazily on first write op. */
+  private defaultParentId: string | null = null;
 
   // ---------------------------------------------------------------------------
   // File mutations

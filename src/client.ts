@@ -21,6 +21,7 @@ import { FileSessionStore } from './session';
 import { DEFAULTS } from './internal/constants';
 import { createApiClient, createLoginClient } from './internal/http';
 import { AuthService, IAuthService } from './internal/auth';
+import { ProfileService, IProfileService } from './internal/profile';
 import { FileService, IFileService } from './internal/files';
 import { UploadService, IUploadService } from './internal/upload';
 import { DownloadService, IDownloadService } from './internal/download';
@@ -34,6 +35,7 @@ import { DownloadService, IDownloadService } from './internal/download';
  * | Service           | Responsibility                                        |
  * |-------------------|-------------------------------------------------------|
  * | `AuthService`     | Login, logout, session restore, token refresh.        |
+ * | `ProfileService`  | User-profile read and update.                         |
  * | `FileService`     | Listing, search, metadata, rename, move, delete, share.|
  * | `UploadService`   | Single-file and recursive-directory uploads.          |
  * | `DownloadService` | Presigned URL resolution and file streaming.          |
@@ -68,6 +70,7 @@ import { DownloadService, IDownloadService } from './internal/download';
  */
 export class DegooClient {
   private readonly authSvc: IAuthService;
+  private readonly profileSvc: IProfileService;
   private readonly fileSvc: IFileService;
   private readonly uploadSvc: IUploadService;
   private readonly downloadSvc: IDownloadService;
@@ -94,6 +97,7 @@ export class DegooClient {
     const loginHttp = createLoginClient(userAgent, apiToken, config.loginHeaders);
 
     this.authSvc     = new AuthService(loginHttp, apiHttp, sessionStore, loginUrl, accessTokenUrl, apiUrl);
+    this.profileSvc  = new ProfileService(apiHttp, apiUrl, this.authSvc);
     this.fileSvc     = new FileService(apiHttp, apiUrl, this.authSvc);
     this.uploadSvc   = new UploadService(apiHttp, apiUrl, this.authSvc, this.fileSvc, blockSize);
     this.downloadSvc = new DownloadService(this.fileSvc);
@@ -149,7 +153,19 @@ export class DegooClient {
    * @throws `DegooError('Unauthorized')` if the session has expired.
    */
   getProfile(): Promise<UserProfile> {
-    return this.fileSvc.getProfile();
+    return this.profileSvc.getProfile();
+  }
+
+  /**
+   * Updates editable profile fields. Pass only the fields to change.
+   *
+   * @example
+   * await client.updateProfile({ FirstName: 'Test', LastName: 'User' });
+   */
+  updateProfile(
+    updates: Partial<Pick<UserProfile, 'FirstName' | 'LastName' | 'CountryCode' | 'LanguageCode'>>,
+  ): Promise<void> {
+    return this.profileSvc.updateProfile(updates);
   }
 
   // ---------------------------------------------------------------------------

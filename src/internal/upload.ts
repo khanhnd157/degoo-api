@@ -101,7 +101,7 @@ export class UploadService implements IUploadService {
     // Backwards compatibility: callers used to pass a plain string filename.
     const opts: UploadOptions = typeof options === 'string' ? { filename: options } : options;
 
-    const pid = this.pid(pathId);
+    const pid = await this.resolvePid(pathId);
 
     let stat: fs.Stats;
     try {
@@ -119,7 +119,7 @@ export class UploadService implements IUploadService {
   }
 
   async uploadDirectory(dirPath: string, pathId?: string | number): Promise<void> {
-    const pid = this.pid(pathId);
+    const pid = await this.resolvePid(pathId);
 
     let entries: string[];
     try {
@@ -153,11 +153,12 @@ export class UploadService implements IUploadService {
   // ---------------------------------------------------------------------------
 
   /**
-   * Resolves a caller-supplied `pathId` to a string, falling back to the
-   * user's root folder when no `pathId` is provided.
+   * Resolves a caller-supplied `pathId`, delegating the lookup of the
+   * device-folder root to `IFileService.resolveDefaultParent`. See that
+   * method for why uploads cannot target the literal root `"0"`.
    */
-  private pid(pathId?: string | number): string {
-    return String(pathId ?? (this.auth.getRootPathId() || '0'));
+  private resolvePid(pathId?: string | number): Promise<string> {
+    return this.files.resolveDefaultParent(pathId);
   }
 
   private throwIfAborted(signal: AbortSignal | undefined, stage: string): void {
@@ -369,16 +370,9 @@ export class UploadService implements IUploadService {
     opts: UploadOptions,
   ): Promise<void> {
     const mime = UploadService.getMimeType(ext);
-    const fileStream = fs.createReadStream(filePath);
-
-    let uploaded = 0;
-    if (opts.onProgress) {
-      const cb = opts.onProgress;
-      fileStream.on('data', (chunk) => {
-        uploaded += (chunk as Buffer).length;
-        cb(uploaded, fileSize);
-      });
-    }
+    // 64 KiB highWaterMark — explicit so disk reads cannot outrun network
+    // backpressure, even on fast SSDs.
+    const fileStream = fs.createReadStream(filePath, { highWaterMark: 64 * 1024 });
 
     const form = new FormData();
     form.append('key', `${auth.KeyPrefix}${ext}/${checksum}.${ext}`);
@@ -394,6 +388,12 @@ export class UploadService implements IUploadService {
       form.getLength((err, len) => (err ? reject(err) : resolve(len)));
     });
 
+    // Axios reports progress relative to the total request body (form fields
+    // + boundaries + file). For UX, scale the file payload to [0, fileSize].
+    // The form overhead is small (~hundreds of bytes), but rounding via
+    // Math.min avoids ever exceeding fileSize.
+    const onProgress = opts.onProgress;
+
     try {
       await this.http.post(auth.BaseURL, form, {
         headers: {
@@ -403,11 +403,21 @@ export class UploadService implements IUploadService {
         },
         signal: opts.signal,
         timeout: opts.timeoutMs && opts.timeoutMs > 0 ? opts.timeoutMs : 0,
+        // Axios v1.16+ supports onUploadProgress on the Node http adapter;
+        // it pipelines through an AxiosTransformStream that measures bytes
+        // at network consumption rate (not disk read rate), so the UI sees
+        // true upload speed.
+        onUploadProgress: onProgress
+          ? (e) => {
+              const sent = Math.min(e.loaded, fileSize);
+              onProgress(sent, fileSize);
+            }
+          : undefined,
       });
     } catch (err) {
       throwDegooError(err);
     } finally {
-      // If axios bailed early, make sure we are not leaking the read stream.
+      // Make sure the file descriptor is released on cancel/timeout/throw.
       if (!fileStream.destroyed) fileStream.destroy();
     }
   }
