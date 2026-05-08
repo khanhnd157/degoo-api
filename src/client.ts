@@ -29,7 +29,7 @@ import { DownloadService, IDownloadService } from './internal/download';
 /**
  * The main entry point for the Degoo SDK.
  *
- * `DegooClient` is a **facade** (GoF Facade pattern) composing four
+ * `DegooClient` is a **facade** (GoF Facade pattern) composing five
  * focused services behind a single ergonomic API:
  *
  * | Service           | Responsibility                                        |
@@ -76,7 +76,7 @@ export class DegooClient {
   private readonly downloadSvc: IDownloadService;
 
   /**
-   * Constructs a `DegooClient` with all four internal services wired up.
+   * Constructs a `DegooClient` with all five internal services wired up.
    *
    * Prefer the static `DegooClient.connect()` factory — it handles login in
    * a single `await`.

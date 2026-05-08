@@ -1,9 +1,9 @@
 import fs from 'fs';
 import path from 'path';
-import { AxiosInstance } from 'axios';
+import axios, { AxiosInstance } from 'axios';
 import FormData from 'form-data';
 
-import { DegooError } from '../errors';
+import { DegooError, DegooErrorCode } from '../errors';
 import { UploadAuthData, UploadOptions, UploadResult } from '../types';
 import { IAuthService } from './auth';
 import { IFileService } from './files';
@@ -163,7 +163,7 @@ export class UploadService implements IUploadService {
 
   private throwIfAborted(signal: AbortSignal | undefined, stage: string): void {
     if (signal?.aborted) {
-      throw new DegooError(`Upload aborted: ${stage}`);
+      throw new DegooError(`Upload aborted: ${stage}`, undefined, DegooErrorCode.Aborted);
     }
   }
 
@@ -207,14 +207,14 @@ export class UploadService implements IUploadService {
     // Step 5: register the metadata entry.
     await this.files.registerItem(name, pathId, String(size), checksum);
 
-    // Step 6: resolve the just-created file entry. Filter the search hits by
-    // ParentID + checksum so we do not return a stale homonym from elsewhere
-    // in the user's tree (the previous version returned `results[0]` which
-    // could match an unrelated file when the same name appeared multiple times).
+    // Step 6: resolve the just-created file entry. Match strictly on the
+    // destination ParentID — the global search index can lag behind the
+    // mutation, in which case `file` will be `undefined` (already permitted
+    // by `UploadResult.file`). Returning a homonym from another folder
+    // would be worse than nothing: the caller would get an unrelated file's
+    // ID and presigned URL.
     const candidates = await this.files.search(name, 20);
-    const file =
-      candidates.find((c) => c.ParentID === pathId) ??
-      candidates[0];
+    const file = candidates.find((c) => c.ParentID === pathId);
 
     return { name, pathId, alreadyExists, file };
   }
@@ -222,9 +222,11 @@ export class UploadService implements IUploadService {
   /**
    * Sends a `GetOverlay4` query to prime Degoo's upload pipeline.
    *
-   * Bug fix vs prior version: `IDType.FileID` is `String!` per the AppSync
-   * schema; previously this sent an integer `0`, which failed validation
-   * silently because the call site swallowed the error.
+   * The query needs an `IDType.FileID` (`String!` per the AppSync schema).
+   * Use the user's actual root id when available — accounts whose login
+   * redirect resolved to a non-`"0"` folder will reject a hard-coded `"0"`
+   * with anything other than `Got empty result!`, and our caller only
+   * swallows that one specific message.
    */
   private async pingOverlay(): Promise<void> {
     const query = `
@@ -238,7 +240,10 @@ export class UploadService implements IUploadService {
         errors?: Array<{ message: string }>;
       }>(this.apiUrl, {
         operationName: 'GetOverlay4',
-        variables: { Token: this.auth.getToken(), ID: { FileID: '0' } },
+        variables: {
+          Token: this.auth.getToken(),
+          ID: { FileID: this.auth.getRootPathId() || '0' },
+        },
         query,
       });
       checkGqlErrors(data);
@@ -415,6 +420,12 @@ export class UploadService implements IUploadService {
           : undefined,
       });
     } catch (err) {
+      // Preserve the abort contract: when the caller's AbortSignal fires
+      // mid-flight, axios rejects with a Cancel/Canceled — translate that
+      // back into our Aborted code so consumers can branch on it.
+      if (axios.isCancel(err) || opts.signal?.aborted) {
+        throw new DegooError('Upload aborted: S3 transfer', undefined, DegooErrorCode.Aborted);
+      }
       throwDegooError(err);
     } finally {
       // Make sure the file descriptor is released on cancel/timeout/throw.

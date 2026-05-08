@@ -66,7 +66,26 @@ const buildRangeHeaders = (range?: ByteRange): http.OutgoingHttpHeaders => {
 };
 
 /** Promise-flavoured `setTimeout`. */
-const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
+/**
+ * Sleeps for `ms`, but resolves early when `signal` aborts.
+ *
+ * Resolves either way — callers re-check `signal.aborted` after waking to
+ * decide whether to continue. Doing this inside a `Promise.race` would leak
+ * the timer; we clear it explicitly in either branch.
+ */
+const abortableSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 
 /** Throws `DegooError(InvalidArgument)` if the value is not a non-empty string. */
 function assertNonEmptyString(value: unknown, name: string): asserts value is string {
@@ -385,7 +404,10 @@ export class DownloadService implements IDownloadService {
         ) {
           break;
         }
-        await sleep(DOWNLOAD_DEFAULTS.initialBackoffMs * 2 ** attempt);
+        await abortableSleep(
+          DOWNLOAD_DEFAULTS.initialBackoffMs * 2 ** attempt,
+          options.signal,
+        );
       }
     }
     throw lastErr ?? new DegooError('Download failed', undefined, DegooErrorCode.Network);
@@ -441,7 +463,30 @@ export class DownloadService implements IDownloadService {
 
     return new Promise((resolve, reject) => {
       const get = url.startsWith('https') ? https.get : http.get;
-      const req = get(url, { headers, timeout: timeoutMs }, (res) => {
+
+      // Install the abort handler reference up-front so the response handler
+      // can reference `removeAbortListener` without a hoisting hazard, and so
+      // that any abort fired between `get()` and our subsequent
+      // `addEventListener` is observed: we re-check `signal.aborted`
+      // immediately after attaching and destroy the request if so.
+      let req: http.ClientRequest | undefined;
+      let abortHandler: (() => void) | undefined;
+      const removeAbortListener = (): void => {
+        if (abortHandler && signal) {
+          signal.removeEventListener('abort', abortHandler);
+          abortHandler = undefined;
+        }
+      };
+      if (signal) {
+        abortHandler = (): void => {
+          req?.destroy(new DegooError(
+            'Download aborted', undefined, DegooErrorCode.Aborted,
+          ));
+        };
+        signal.addEventListener('abort', abortHandler);
+      }
+
+      req = get(url, { headers, timeout: timeoutMs }, (res) => {
         const status = res.statusCode;
 
         // Redirect — drain body, release this attempt's listener, recurse.
@@ -495,19 +540,13 @@ export class DownloadService implements IDownloadService {
         resolve({ res, finalUrl: url });
       });
 
-      let abortHandler: (() => void) | undefined;
-      const removeAbortListener = (): void => {
-        if (abortHandler && signal) {
-          signal.removeEventListener('abort', abortHandler);
-          abortHandler = undefined;
-        }
-      };
-
-      if (signal) {
-        abortHandler = (): void => {
-          req.destroy(new DegooError('Download aborted', undefined, DegooErrorCode.Aborted));
-        };
-        signal.addEventListener('abort', abortHandler);
+      // Close the race between `get()` and `addEventListener('abort', …)`:
+      // if the signal fired during the synchronous request setup above,
+      // observe it now and tear down before any bytes flow.
+      if (signal?.aborted) {
+        req.destroy(new DegooError(
+          'Download aborted', undefined, DegooErrorCode.Aborted,
+        ));
       }
 
       req.on('timeout', () => {

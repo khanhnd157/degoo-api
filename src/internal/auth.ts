@@ -105,9 +105,7 @@ export class AuthService implements IAuthService {
 
       // Persist the session for future restores.
       // Failure here is non-critical — the client is still logged in for this run.
-      await this.session
-        .save(`${this.token}\n${this.refreshToken}\n${this.rootPathId}`)
-        .catch(() => undefined);
+      await this.session.save(this.serializeSession()).catch(() => undefined);
     } catch (err) {
       throwDegooError(err);
     }
@@ -168,12 +166,12 @@ export class AuthService implements IAuthService {
     const stored = await this.session.load();
     if (!stored) return false;
 
-    const [token, refreshToken, rootPathId] = stored.split('\n');
-    if (!token) return false;
+    const parsed = this.parseSession(stored);
+    if (!parsed?.token) return false;
 
-    this.token = token;
-    this.refreshToken = refreshToken ?? '';
-    this.rootPathId = rootPathId ?? '';
+    this.token = parsed.token;
+    this.refreshToken = parsed.refreshToken;
+    this.rootPathId = parsed.rootPathId;
 
     try {
       await this.validateToken();
@@ -183,9 +181,7 @@ export class AuthService implements IAuthService {
       if (this.refreshToken) {
         try {
           this.token = await this.exchangeToken(this.refreshToken);
-          await this.session
-            .save(`${this.token}\n${this.refreshToken}\n${this.rootPathId}`)
-            .catch(() => undefined);
+          await this.session.save(this.serializeSession()).catch(() => undefined);
           return true;
         } catch {
           // Refresh token also invalid — must do a full re-login.
@@ -197,6 +193,57 @@ export class AuthService implements IAuthService {
       this.rootPathId = '';
       return false;
     }
+  }
+
+  /**
+   * Serialises the in-memory session as JSON.
+   *
+   * The legacy newline-delimited format silently misparsed when any field
+   * contained a newline (corrupted token, future schema additions). JSON
+   * is robust against that and forward-compatible: new fields can land
+   * here without breaking existing readers.
+   */
+  private serializeSession(): string {
+    return JSON.stringify({
+      v: 1,
+      token: this.token,
+      refreshToken: this.refreshToken,
+      rootPathId: this.rootPathId,
+    });
+  }
+
+  /**
+   * Parses a stored session, accepting both the JSON format and the legacy
+   * newline-delimited format (for users upgrading across SDK versions).
+   * Returns `null` when the payload is unrecognisable.
+   */
+  private parseSession(
+    raw: string,
+  ): { token: string; refreshToken: string; rootPathId: string } | null {
+    const trimmed = raw.trimStart();
+    if (trimmed.startsWith('{')) {
+      try {
+        const obj = JSON.parse(trimmed) as {
+          token?: unknown; refreshToken?: unknown; rootPathId?: unknown;
+        };
+        if (typeof obj.token !== 'string') return null;
+        return {
+          token: obj.token,
+          refreshToken: typeof obj.refreshToken === 'string' ? obj.refreshToken : '',
+          rootPathId: typeof obj.rootPathId === 'string' ? obj.rootPathId : '',
+        };
+      } catch {
+        return null;
+      }
+    }
+    // Legacy newline-delimited format: token\nrefreshToken\nrootPathId
+    const [token, refreshToken, rootPathId] = raw.split('\n');
+    if (!token) return null;
+    return {
+      token,
+      refreshToken: refreshToken ?? '',
+      rootPathId: rootPathId ?? '',
+    };
   }
 
   /**
