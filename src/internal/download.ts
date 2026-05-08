@@ -74,6 +74,31 @@ function assertNonEmptyString(value: unknown, name: string): asserts value is st
   }
 }
 
+/**
+ * Resolves a destination path and verifies it stays inside `destDir`.
+ *
+ * Defends against path-traversal attacks where an attacker-controlled
+ * filename (e.g. a server-supplied `file.Name` like `../../etc/passwd`)
+ * would otherwise escape the caller's intended write directory.
+ *
+ * @throws `DegooError(InvalidArgument)` if the resolved path leaves `destDir`.
+ */
+function resolveSafeDestPath(destDir: string, filename: string): string {
+  const baseDir = path.resolve(destDir);
+  const destPath = path.resolve(baseDir, filename);
+  // Ensure destPath is baseDir itself (impossible — filename is required) or a
+  // strict descendant. The trailing separator prevents `/foo/bar` from being
+  // accepted when baseDir is `/foo/ba`.
+  if (destPath !== baseDir && !destPath.startsWith(baseDir + path.sep)) {
+    throw new DegooError(
+      `Filename "${filename}" escapes destination directory`,
+      undefined,
+      DegooErrorCode.InvalidArgument,
+    );
+  }
+  return destPath;
+}
+
 /** Validates the shape and bounds of a `ByteRange`. */
 function assertValidRange(range: ByteRange | undefined): void {
   if (!range) return;
@@ -219,7 +244,7 @@ export class DownloadService implements IDownloadService {
     const { file, url } = await this.resolveDownloadUrl(fileId);
 
     const filename = options.filename ?? file.Name;
-    const destPath = path.join(destDir, filename);
+    const destPath = resolveSafeDestPath(destDir, filename);
 
     const { stream, size: total } = await this.openHttpStream(url, {
       signal: options.signal,
@@ -380,6 +405,16 @@ export class DownloadService implements IDownloadService {
             ));
           }
           const nextUrl = new URL(location, url).toString();
+          // Refuse to downgrade transport: a redirect from HTTPS to plain HTTP
+          // would expose the Range header and response body to network
+          // observers. This blocks a class of MITM and open-redirect attacks.
+          if (url.startsWith('https://') && nextUrl.startsWith('http://')) {
+            return reject(new DegooError(
+              'Refusing to follow redirect from HTTPS to HTTP',
+              status,
+              DegooErrorCode.HttpStatus,
+            ));
+          }
           this.requestWithRedirects(nextUrl, headers, signal, timeoutMs, redirects + 1)
             .then(resolve, reject);
           return;
