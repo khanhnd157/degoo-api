@@ -1,6 +1,6 @@
 export { DegooClient } from './client';
 export { DegooError, DegooErrorCode } from './errors';
-export { FileSessionStore, MemorySessionStore } from './session';
+export { FileSessionStore, EncryptedFileSessionStore, MemorySessionStore } from './session';
 export { FileCategory } from './types';
 export type {
   ByteRange,
