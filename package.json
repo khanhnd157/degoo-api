@@ -27,7 +27,7 @@
   "keywords": ["degoo", "cloud-storage", "sdk"],
   "license": "MIT",
   "dependencies": {
-    "axios": "^1.6.0",
+    "axios": "^1.15.2",
     "form-data": "^4.0.0"
   },
   "devDependencies": {
